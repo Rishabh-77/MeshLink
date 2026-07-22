@@ -69,6 +69,19 @@ class AppStateStoreTest {
     }
 
     @Test
+    fun `clearing BLE peers immediately removes stale BLE routes`() {
+        AppStateStore.setTransportPeers("BLE", listOf("ble-peer"))
+        AppStateStore.setTransportPeers("WIFI", listOf("wifi-peer"))
+
+        AppStateStore.clearTransportPeers("BLE")
+
+        assertEquals(listOf("wifi-peer"), AppStateStore.peers.value)
+
+        AppStateStore.clearTransportPeers("WIFI")
+        assertEquals(emptyList<String>(), AppStateStore.peers.value)
+    }
+
+    @Test
     fun `direct peers union across transports`() {
         AppStateStore.setTransportDirectPeers("BLE", listOf("ble-1", "shared"))
         AppStateStore.setTransportDirectPeers("WIFI", listOf("wifi-1", "shared"))

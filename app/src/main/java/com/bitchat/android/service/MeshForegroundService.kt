@@ -5,14 +5,19 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import com.Meshlink.android.MainActivity
 import com.Meshlink.android.R
 import com.Meshlink.android.mesh.BluetoothMeshService
@@ -115,6 +120,20 @@ class MeshForegroundService : Service() {
     private val scope = CoroutineScope(Dispatchers.Default + serviceJob)
     private var isInForeground: Boolean = false
     private var isShuttingDown: Boolean = false
+    private var bluetoothReceiverRegistered = false
+    @Volatile private var bluetoothAdapterAvailable: Boolean? = null
+
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF,
+                BluetoothAdapter.STATE_OFF -> handleBluetoothAdapterUnavailable()
+
+                BluetoothAdapter.STATE_ON -> handleBluetoothAdapterAvailable()
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -131,6 +150,43 @@ class MeshForegroundService : Service() {
             MeshServiceHolder.attach(created)
         }
         MeshServiceHolder.getUnifiedOrCreate(applicationContext)
+
+        ContextCompat.registerReceiver(
+            this,
+            bluetoothStateReceiver,
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        bluetoothReceiverRegistered = true
+
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+        bluetoothAdapterAvailable = try { adapter?.isEnabled == true } catch (_: SecurityException) { false }
+        if (bluetoothAdapterAvailable == false) {
+            // Set null so the transition handler performs its cleanup on initial service start.
+            bluetoothAdapterAvailable = null
+            handleBluetoothAdapterUnavailable()
+        }
+    }
+
+    private fun handleBluetoothAdapterUnavailable() {
+        if (bluetoothAdapterAvailable == false) return
+        bluetoothAdapterAvailable = false
+        Log.i("MeshForegroundService", "Bluetooth adapter is off; clearing BLE transport state")
+        try { meshService?.onBluetoothAdapterUnavailable() } catch (e: Exception) {
+            Log.e("MeshForegroundService", "Failed to reset BLE after adapter shutdown", e)
+        }
+        if (isInForeground) updateNotification(force = false)
+    }
+
+    private fun handleBluetoothAdapterAvailable() {
+        if (bluetoothAdapterAvailable == true) return
+        bluetoothAdapterAvailable = true
+        Log.i("MeshForegroundService", "Bluetooth adapter is on; scheduling a clean BLE restart")
+        scope.launch {
+            // Give the platform Bluetooth process time to become ready after STATE_ON.
+            delay(750)
+            if (bluetoothAdapterAvailable == true) ensureMeshStarted()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -380,6 +436,10 @@ class MeshForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        if (bluetoothReceiverRegistered) {
+            try { unregisterReceiver(bluetoothStateReceiver) } catch (_: Exception) { }
+            bluetoothReceiverRegistered = false
+        }
         updateJob?.cancel()
         updateJob = null
         // Cancel the service coroutine scope to prevent leaks

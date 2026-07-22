@@ -617,8 +617,12 @@ class BluetoothMeshService(private val context: Context) : TransportBridgeServic
                 // ConnectionTracker has already removed the address mapping; be defensive either way
                 connectionManager.addressPeerMap.remove(addr)
 
-                // refresh peer list on disconnect. 
-                try { peerManager.refreshPeerList() } catch (_: Exception) { }
+                if (peer != null && !connectionManager.addressPeerMap.containsValue(peer)) {
+                    Log.i(TAG, "Last direct BLE path lost for $peer; removing peer immediately")
+                    peerManager.removePeer(peer)
+                } else {
+                    try { peerManager.refreshPeerList() } catch (_: Exception) { }
+                }
 
                 if (peer != null) {
                     // Verbose debug: device disconnected
@@ -698,10 +702,36 @@ class BluetoothMeshService(private val context: Context) : TransportBridgeServic
         announceJob = null
         com.Meshlink.android.service.MeshServiceHolder.stopSharedGossip("BLE")
         TransportBridgeService.unregister("BLE")
+        clearBlePeerState()
+        connectionManager.disableTransport()
+    }
+
+    /**
+     * Reset all state that is only valid while the Bluetooth adapter is available.
+     *
+     * Android can tear down GATT without delivering every per-device disconnect callback when
+     * the user switches the adapter off. Keeping those peers would make the UI advertise dead
+     * routes and would retain unusable Noise sessions across the adapter restart.
+     */
+    private fun clearBlePeerState() {
+        connectionManager.addressPeerMap.clear()
+
+        // Remove peers individually so the normal removal delegate also invalidates topology,
+        // encryption sessions, routing state, and the process-wide peer list.
+        peerManager.getActivePeerIDs().forEach { peerID ->
+            peerManager.removePeer(peerID)
+        }
+
+        // Defensive cleanup for an empty manager or a temporarily detached delegate.
         try { com.Meshlink.android.services.AppStateStore.clearTransportPeers("BLE") } catch (_: Exception) { }
         try { com.Meshlink.android.services.AppStateStore.clearTransportDirectPeers("BLE") } catch (_: Exception) { }
-        connectionManager.disableTransport()
         try { peerManager.refreshPeerList() } catch (_: Exception) { }
+    }
+
+    /** Called by the foreground-service adapter receiver when Bluetooth becomes unavailable. */
+    fun onBluetoothAdapterUnavailable() {
+        Log.i(TAG, "Bluetooth adapter unavailable; invalidating BLE peers and connections")
+        pauseServicesForTransportDisable()
     }
     
     /**
